@@ -104,22 +104,11 @@ const INITIAL_WALL_MESSAGES: WallMessage[] = [
 ];
 
 export default function App() {
-  // Load Site Configuration (Live & Persistent via LocalStorage + Supabase sync)
-  const [config, setConfig] = useState<SiteConfig>(() => {
-    try {
-      const savedConfig = localStorage.getItem('berbagi_kebikean_config_v4');
-      if (savedConfig) {
-        return { ...DEFAULT_SITE_CONFIG, ...JSON.parse(savedConfig) };
-      }
-    } catch {
-      // Fallback
-    }
-    return DEFAULT_SITE_CONFIG;
-  });
+  // Load Site Configuration (Langsung default, tanpa membaca localStorage lama)
+  const [config, setConfig] = useState<SiteConfig>(DEFAULT_SITE_CONFIG);
 
   // --- AMBIL DATA DARI SUPABASE AGAR SAMA DI SEMUA HP & LAPTOP ---
   useEffect(() => {
-    let isMounted = true;
     async function muatDataDunia() {
       try {
         if (!supabase) return;
@@ -127,31 +116,22 @@ export default function App() {
           .from('landingpage_config')
           .select('config_data')
           .eq('id', 1)
-          .maybeSingle();
+          .single();
 
         if (error) {
-          console.warn('Supabase sinkronisasi notice:', error.message);
+          console.warn('Notice Supabase:', error.message);
           return;
         }
 
-        if (data && data.config_data && isMounted) {
-          // Memaksa website menggunakan data seragam dari Supabase
-          const merged = { ...DEFAULT_SITE_CONFIG, ...data.config_data };
-          setConfig(merged);
-          try {
-            localStorage.setItem('berbagi_kebikean_config_v4', JSON.stringify(merged));
-          } catch (e) {
-            console.warn(e);
-          }
+        if (data && data.config_data) {
+          // Memasukkan data seragam dari Supabase ke dalam config
+          setConfig(data.config_data);
         }
       } catch (err) {
-        console.warn('Gagal sinkronisasi data Supabase:', err);
+        console.error('Gagal sinkronisasi data dari Supabase:', err);
       }
     }
     muatDataDunia();
-    return () => {
-      isMounted = false;
-    };
   }, []);
 
   // Navigation State
@@ -346,28 +326,31 @@ export default function App() {
     }
   }, [isCustomizerOpen, config]);
 
-  // Handle Save Customizer Configuration (LocalStorage + Supabase Cloud Database)
+  // Handle Save Customizer Configuration (Supabase Cloud Database)
   const handleSaveConfig = async () => {
-    setConfig(tempConfig);
-    try {
-      localStorage.setItem('berbagi_kebikean_config_v4', JSON.stringify(tempConfig));
-    } catch (e) {
-      console.error(e);
-    }
+    const updatedConfig = tempConfig;
+    setConfig(updatedConfig);
 
-    // Integrasi Database Supabase: Simpan data terbaru ke baris ID 1 pada tabel 'landingpage_config'
+    // Mengirim data terbaru ke database Supabase pada baris ID 1
     try {
       if (supabase) {
         const { error } = await supabase
           .from('landingpage_config')
-          .upsert({ id: 1, config_data: tempConfig });
+          .upsert({ id: 1, config_data: updatedConfig });
 
         if (error) {
-          console.warn('Catatan Supabase:', error.message);
+          alert('Gagal menyimpan ke database Supabase: ' + error.message);
+        } else {
+          setCustomizerSaveToast(true);
+          setTimeout(() => {
+            setCustomizerSaveToast(false);
+            setIsCustomizerOpen(false);
+          }, 1500);
+          return;
         }
       }
     } catch (err) {
-      console.warn('Supabase sync skipped:', err);
+      console.error('Gagal menyimpan ke database Supabase:', err);
     }
 
     setCustomizerSaveToast(true);
@@ -378,12 +361,16 @@ export default function App() {
   };
 
   // Handle Reset to Default Config
-  const handleResetConfig = () => {
+  const handleResetConfig = async () => {
     if (window.confirm('Kembalikan semua teks, angka, rekening, dan foto ke setelan awal?')) {
       setConfig(DEFAULT_SITE_CONFIG);
       setTempConfig(DEFAULT_SITE_CONFIG);
       try {
-        localStorage.removeItem('berbagi_kebikean_config_v4');
+        if (supabase) {
+          await supabase
+            .from('landingpage_config')
+            .upsert({ id: 1, config_data: DEFAULT_SITE_CONFIG });
+        }
       } catch (e) {
         console.error(e);
       }
