@@ -1,3 +1,4 @@
+import { supabase } from './supabaseClient'
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -103,7 +104,7 @@ const INITIAL_WALL_MESSAGES: WallMessage[] = [
 ];
 
 export default function App() {
-  // Load Site Configuration (Live & Persistent)
+  // Load Site Configuration (Live & Persistent via LocalStorage + Supabase sync)
   const [config, setConfig] = useState<SiteConfig>(() => {
     try {
       const savedConfig = localStorage.getItem('berbagi_kebikean_config_v4');
@@ -115,6 +116,43 @@ export default function App() {
     }
     return DEFAULT_SITE_CONFIG;
   });
+
+  // --- AMBIL DATA DARI SUPABASE AGAR SAMA DI SEMUA HP & LAPTOP ---
+  useEffect(() => {
+    let isMounted = true;
+    async function muatDataDunia() {
+      try {
+        if (!supabase) return;
+        const { data, error } = await supabase
+          .from('landingpage_config')
+          .select('config_data')
+          .eq('id', 1)
+          .maybeSingle();
+
+        if (error) {
+          console.warn('Supabase sinkronisasi notice:', error.message);
+          return;
+        }
+
+        if (data && data.config_data && isMounted) {
+          // Memaksa website menggunakan data seragam dari Supabase
+          const merged = { ...DEFAULT_SITE_CONFIG, ...data.config_data };
+          setConfig(merged);
+          try {
+            localStorage.setItem('berbagi_kebikean_config_v4', JSON.stringify(merged));
+          } catch (e) {
+            console.warn(e);
+          }
+        }
+      } catch (err) {
+        console.warn('Gagal sinkronisasi data Supabase:', err);
+      }
+    }
+    muatDataDunia();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   // Navigation State
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
@@ -308,14 +346,30 @@ export default function App() {
     }
   }, [isCustomizerOpen, config]);
 
-  // Handle Save Customizer Configuration
-  const handleSaveConfig = () => {
+  // Handle Save Customizer Configuration (LocalStorage + Supabase Cloud Database)
+  const handleSaveConfig = async () => {
     setConfig(tempConfig);
     try {
       localStorage.setItem('berbagi_kebikean_config_v4', JSON.stringify(tempConfig));
     } catch (e) {
       console.error(e);
     }
+
+    // Integrasi Database Supabase: Simpan data terbaru ke baris ID 1 pada tabel 'landingpage_config'
+    try {
+      if (supabase) {
+        const { error } = await supabase
+          .from('landingpage_config')
+          .upsert({ id: 1, config_data: tempConfig });
+
+        if (error) {
+          console.warn('Catatan Supabase:', error.message);
+        }
+      }
+    } catch (err) {
+      console.warn('Supabase sync skipped:', err);
+    }
+
     setCustomizerSaveToast(true);
     setTimeout(() => {
       setCustomizerSaveToast(false);
