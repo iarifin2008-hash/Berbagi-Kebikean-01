@@ -103,6 +103,18 @@ const INITIAL_WALL_MESSAGES: WallMessage[] = [
   }
 ];
 
+// Helper resolusi URL gambar: aman untuk Base64, URL eksternal, dan asset lokal public
+export const resolveImageUrl = (src?: string | null): string => {
+  if (!src) return '';
+  if (src.startsWith('data:image') || src.startsWith('http://') || src.startsWith('https://')) {
+    return src;
+  }
+  if (src.startsWith('/src/assets/images/')) {
+    return src.replace('/src/assets/images/', '/images/');
+  }
+  return src;
+};
+
 export default function App() {
   // Load Site Configuration (Langsung default, tanpa membaca localStorage lama)
   const [config, setConfig] = useState<SiteConfig>(DEFAULT_SITE_CONFIG);
@@ -116,7 +128,7 @@ export default function App() {
           .from('landingpage_config')
           .select('config_data')
           .eq('id', 1)
-          .single();
+          .maybeSingle();
 
         if (error) {
           console.warn('Notice Supabase:', error.message);
@@ -124,8 +136,16 @@ export default function App() {
         }
 
         if (data && data.config_data) {
-          // Memasukkan data seragam dari Supabase ke dalam config
-          setConfig(data.config_data);
+          // Memasukkan data seragam dari Supabase ke dalam config dengan fallback default
+          setConfig({
+            ...DEFAULT_SITE_CONFIG,
+            ...data.config_data,
+            hero: { ...DEFAULT_SITE_CONFIG.hero, ...(data.config_data.hero || {}) },
+            about: { ...DEFAULT_SITE_CONFIG.about, ...(data.config_data.about || {}) },
+            volunteerConfig: { ...DEFAULT_SITE_CONFIG.volunteerConfig, ...(data.config_data.volunteerConfig || {}) },
+            wallConfig: { ...DEFAULT_SITE_CONFIG.wallConfig, ...(data.config_data.wallConfig || {}) },
+            contacts: { ...DEFAULT_SITE_CONFIG.contacts, ...(data.config_data.contacts || {}) }
+          });
         }
       } catch (err) {
         console.error('Gagal sinkronisasi data dari Supabase:', err);
@@ -166,26 +186,6 @@ export default function App() {
     try {
       if (!supabase) return;
 
-      // 1. Coba baca dari tabel landingpage_messages
-      const { data: dbData, error: dbErr } = await supabase
-        .from('landingpage_messages')
-        .select('*')
-        .order('id', { ascending: false });
-
-      if (!dbErr && dbData && Array.isArray(dbData) && dbData.length > 0) {
-        setMessages(
-          dbData.map((m: any) => ({
-            id: String(m.id || m.message_id || 'msg-' + Math.random()),
-            name: m.name || 'Sahabat Kebaikan',
-            city: m.city || 'Indonesia',
-            message: m.message || '',
-            timestamp: m.timestamp || 'Baru saja'
-          }))
-        );
-        return;
-      }
-
-      // 2. Fallback baca dari baris id: 2 di landingpage_config
       const { data: configData, error: cfgErr } = await supabase
         .from('landingpage_config')
         .select('config_data')
@@ -193,7 +193,22 @@ export default function App() {
         .maybeSingle();
 
       if (!cfgErr && configData && Array.isArray(configData.config_data) && configData.config_data.length > 0) {
-        setMessages(configData.config_data);
+        const validList = configData.config_data
+          .filter((m: any) => m && (m.name || m.message))
+          .map((m: any) => ({
+            id: String(m.id || 'msg-' + Math.random()),
+            name: String(m.name || 'Sahabat Kebaikan'),
+            city: String(m.city || 'Indonesia'),
+            message: String(m.message || ''),
+            timestamp: String(m.timestamp || 'Baru saja')
+          }));
+
+        if (validList.length > 0) {
+          setMessages(validList);
+          try {
+            localStorage.setItem('berbagi_kebikean_wall_messages_v4', JSON.stringify(validList));
+          } catch {}
+        }
       }
     } catch (err) {
       console.warn('Notice sinkron pesan Supabase:', err);
@@ -203,30 +218,8 @@ export default function App() {
   useEffect(() => {
     muatPesanSupabase();
 
-    // Polling setiap 8 detik agar komentar baru dari HP langsung muncul di laptop tanpa reload
-    const interval = setInterval(muatPesanSupabase, 8000);
-
-    // Coba realtime postgres_changes channel
-    try {
-      if (supabase) {
-        const channel = supabase
-          .channel('realtime_wall_messages')
-          .on('postgres_changes', { event: '*', schema: 'public', table: 'landingpage_messages' }, () => {
-            muatPesanSupabase();
-          })
-          .on('postgres_changes', { event: '*', schema: 'public', table: 'landingpage_config' }, () => {
-            muatPesanSupabase();
-          })
-          .subscribe();
-
-        return () => {
-          clearInterval(interval);
-          supabase.removeChannel(channel);
-        };
-      }
-    } catch (e) {
-      console.warn(e);
-    }
+    // Polling setiap 4 detik agar pesan baru dari HP langsung muncul di laptop tanpa reload
+    const interval = setInterval(muatPesanSupabase, 4000);
 
     return () => clearInterval(interval);
   }, []);
@@ -346,16 +339,20 @@ export default function App() {
     // Sinkronisasi hapus ke database Supabase Cloud
     try {
       if (supabase) {
-        // Coba hapus dari tabel landingpage_messages
-        await supabase
-          .from('landingpage_messages')
-          .delete()
-          .eq('id', id);
+        const { data: dbData } = await supabase
+          .from('landingpage_config')
+          .select('config_data')
+          .eq('id', 2)
+          .maybeSingle();
 
-        // Update juga ke baris id: 2 di landingpage_config agar tersinkron di semua device
+        const currentFromDb: WallMessage[] = Array.isArray(dbData?.config_data)
+          ? dbData.config_data
+          : messages;
+
+        const updatedDb = currentFromDb.filter((m) => m.id !== id);
         await supabase
           .from('landingpage_config')
-          .upsert({ id: 2, config_data: filtered });
+          .upsert({ id: 2, config_data: updatedDb });
       }
     } catch (err) {
       console.warn('Notice hapus pesan Supabase:', err);
@@ -676,24 +673,30 @@ export default function App() {
     setMessageSuccessToast(true);
     setTimeout(() => setMessageSuccessToast(false), 3500);
 
-    // Kirim & sinkronisasi data pesan ke Supabase Cloud
+    // Kirim & sinkronisasi data pesan ke Supabase Cloud (tabel landingpage_config id: 2)
     try {
       if (supabase) {
-        // A. Coba kirim ke tabel landingpage_messages (jika ada)
-        await supabase
-          .from('landingpage_messages')
-          .insert([{
-            id: newMessage.id,
-            name: newMessage.name,
-            city: newMessage.city,
-            message: newMessage.message,
-            timestamp: newMessage.timestamp
-          }]);
+        // Ambil data terbaru dari Supabase agar tidak menimpa pesan yang baru masuk dari pengunjung lain
+        const { data: dbData } = await supabase
+          .from('landingpage_config')
+          .select('config_data')
+          .eq('id', 2)
+          .maybeSingle();
 
-        // B. Simpan juga ke landingpage_config baris id: 2 agar selalu sinkron di semua device (HP, Laptop, dsb.)
+        const currentFromDb: WallMessage[] = Array.isArray(dbData?.config_data)
+          ? dbData.config_data
+          : messages;
+
+        const merged = [newMessage, ...currentFromDb.filter((m) => m.id !== newMessage.id)].slice(0, 100);
+
         await supabase
           .from('landingpage_config')
-          .upsert({ id: 2, config_data: nextMessages.slice(0, 100) });
+          .upsert({ id: 2, config_data: merged });
+
+        setMessages(merged);
+        try {
+          localStorage.setItem('berbagi_kebikean_wall_messages_v4', JSON.stringify(merged));
+        } catch {}
       }
     } catch (err) {
       console.warn('Notice sinkron pesan baru ke Supabase:', err);
@@ -772,9 +775,12 @@ export default function App() {
           <a href="#" className="flex items-center gap-3 group focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 rounded-lg p-1">
             {config.logoImage ? (
               <img
-                src={config.logoImage}
+                src={resolveImageUrl(config.logoImage)}
                 alt={config.communityName}
                 className="w-12 h-12 rounded-2xl object-cover shadow-md border-2 border-sky-300 group-hover:scale-105 transition-transform"
+                onError={(e) => {
+                  (e.currentTarget as HTMLElement).style.display = 'none';
+                }}
               />
             ) : (
               <div className="w-12 h-12 rounded-2xl bg-gradient-to-tr from-sky-500 via-sky-400 to-cyan-300 flex items-center justify-center text-white shadow-md shadow-sky-500/20 group-hover:scale-105 transition-transform duration-200">
@@ -992,7 +998,7 @@ export default function App() {
 
                 <div className="relative rounded-2xl overflow-hidden shadow-2xl border-4 border-white aspect-[16/10] bg-slate-100">
                   <img
-                    src={config.hero.heroImage}
+                    src={resolveImageUrl(config.hero.heroImage)}
                     alt="Aksi Berbagi Kebikean membagikan makanan hangat dengan sepeda"
                     className="w-full h-full object-cover"
                     referrerPolicy="no-referrer"
@@ -1191,7 +1197,7 @@ export default function App() {
               {/* QRIS Code Image */}
               <div className="relative mx-auto max-w-[280px] bg-slate-50 p-4 rounded-2xl border-2 border-slate-200/80 shadow-inner group">
                 <img
-                  src={config.qrisImage}
+                  src={resolveImageUrl(config.qrisImage)}
                   alt={`QRIS Donasi Komunitas ${config.communityName}`}
                   className="w-full h-auto rounded-xl object-contain cursor-zoom-in"
                   onClick={() => setIsQrisModalOpen(true)}
@@ -1215,7 +1221,7 @@ export default function App() {
                   <span>Lihat Tampilan Penuh</span>
                 </button>
                 <a
-                  href={config.qrisImage}
+                  href={resolveImageUrl(config.qrisImage)}
                   download="QRIS_Berbagi_Kebikean.jpg"
                   target="_blank"
                   rel="noreferrer"
@@ -1265,7 +1271,7 @@ export default function App() {
               <div className="relative">
                 <div className="rounded-3xl overflow-hidden border-4 border-slate-100 shadow-xl aspect-[4/3] bg-slate-100">
                   <img
-                    src={config.about.photo}
+                    src={resolveImageUrl(config.about.photo)}
                     alt={config.about.title}
                     className="w-full h-full object-cover"
                     referrerPolicy="no-referrer"
@@ -1358,7 +1364,7 @@ export default function App() {
                   <div className="md:col-span-5 bg-sky-100/50 p-6 flex items-center justify-center border-b md:border-b-0 md:border-r border-sky-100">
                     <div className="relative rounded-2xl overflow-hidden shadow-md max-w-sm w-full border-2 border-white aspect-[4/3] md:aspect-[3/4]">
                       <img
-                        src={agenda.posterImage}
+                        src={resolveImageUrl(agenda.posterImage)}
                         alt={agenda.title}
                         className="w-full h-full object-cover"
                         referrerPolicy="no-referrer"
@@ -1529,7 +1535,7 @@ export default function App() {
                 ) : (
                   <>
                     <img
-                      src={config.galleryMedia[currentMediaIndex]?.src}
+                      src={resolveImageUrl(config.galleryMedia[currentMediaIndex]?.src)}
                       alt={config.galleryMedia[currentMediaIndex]?.title}
                       className="w-full h-full object-cover transition-all duration-500 cursor-pointer"
                       onClick={() => setSelectedPhotoForZoom(config.galleryMedia[currentMediaIndex])}
@@ -1584,7 +1590,7 @@ export default function App() {
                     </div>
                   ) : (
                     <img
-                      src={item.src}
+                      src={resolveImageUrl(item.src)}
                       alt={item.title}
                       className="w-full h-full object-cover"
                       referrerPolicy="no-referrer"
@@ -2196,6 +2202,50 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* Foto Utama Hero Section */}
+                  <div className="p-4 bg-sky-50 rounded-2xl border border-sky-100 space-y-3">
+                    <h4 className="font-bold text-slate-900 text-sm flex items-center gap-2">
+                      <ImageIcon className="w-4 h-4 text-sky-600" />
+                      <span>Foto Utama Halaman Depan (Hero Image)</span>
+                    </h4>
+
+                    <div className="flex flex-col sm:flex-row items-center sm:items-start gap-4">
+                      <img
+                        src={resolveImageUrl(tempConfig.hero.heroImage)}
+                        alt="Preview Hero"
+                        className="w-32 h-20 rounded-xl object-cover border-2 border-sky-300 shadow-md shrink-0"
+                      />
+
+                      <div className="space-y-2 flex-1 w-full">
+                        <label className="w-full px-3 py-2 bg-sky-600 hover:bg-sky-700 text-white font-bold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer shadow-xs text-xs transition-colors">
+                          <Upload className="w-3.5 h-3.5" />
+                          <span>Upload Foto Hero dari HP / Laptop</span>
+                          <input
+                            type="file"
+                            accept="image/*"
+                            className="hidden"
+                            onChange={(e) => handleImageFileUpload(e, (base64) => {
+                              setTempConfig({
+                                ...tempConfig,
+                                hero: { ...tempConfig.hero, heroImage: base64 }
+                              });
+                            })}
+                          />
+                        </label>
+                        <input
+                          type="text"
+                          value={tempConfig.hero.heroImage || ''}
+                          onChange={(e) => setTempConfig({
+                            ...tempConfig,
+                            hero: { ...tempConfig.hero, heroImage: e.target.value }
+                          })}
+                          placeholder="Atau tempel link URL foto hero..."
+                          className="w-full px-2.5 py-1.5 bg-white rounded border border-slate-300 text-[11px]"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div>
                       <label className="block font-bold text-slate-700 mb-1">Nama Komunitas</label>
@@ -2556,7 +2606,11 @@ export default function App() {
                     {tempConfig.agendaList.map((agenda, idx) => (
                       <div key={agenda.id} className="p-3 bg-slate-50 rounded-xl border border-slate-200 flex items-start justify-between gap-3">
                         <div className="flex items-center gap-3">
-                          <img src={agenda.posterImage} alt={agenda.title} className="w-16 h-20 rounded-lg object-cover shrink-0 border" />
+                          <img
+                            src={resolveImageUrl(agenda.posterImage)}
+                            alt={agenda.title}
+                            className="w-16 h-20 rounded-lg object-cover shrink-0 border"
+                          />
                           <div>
                             <p className="font-bold text-slate-900">#{idx + 1} {agenda.title}</p>
                             <p className="text-[11px] text-slate-500">{agenda.date} · {agenda.time}</p>
@@ -2567,21 +2621,37 @@ export default function App() {
                           </div>
                         </div>
 
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (tempConfig.agendaList.length <= 1) {
-                              alert('Sisakan minimal 1 agenda aksi!');
-                              return;
-                            }
-                            const filtered = tempConfig.agendaList.filter((_, i) => i !== idx);
-                            setTempConfig({ ...tempConfig, agendaList: filtered });
-                          }}
-                          className="p-1.5 text-red-500 hover:text-red-700 hover:bg-red-50 rounded-lg"
-                          title="Hapus agenda ini"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
+                        <div className="flex flex-col gap-1.5 shrink-0 items-end">
+                          <label className="px-2.5 py-1 text-xs font-bold text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded-lg cursor-pointer flex items-center gap-1 transition-colors">
+                            <Upload className="w-3.5 h-3.5" />
+                            <span>Ganti Poster</span>
+                            <input
+                              type="file"
+                              accept="image/*"
+                              className="hidden"
+                              onChange={(e) => handleImageFileUpload(e, (base64) => {
+                                const updated = [...tempConfig.agendaList];
+                                updated[idx].posterImage = base64;
+                                setTempConfig({ ...tempConfig, agendaList: updated });
+                              })}
+                            />
+                          </label>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (tempConfig.agendaList.length <= 1) {
+                                alert('Sisakan minimal 1 agenda aksi!');
+                                return;
+                              }
+                              const filtered = tempConfig.agendaList.filter((_, i) => i !== idx);
+                              setTempConfig({ ...tempConfig, agendaList: filtered });
+                            }}
+                            className="p-1.5 text-red-500 hover:text-red-700 hover:bg-red-50 rounded-lg cursor-pointer"
+                            title="Hapus agenda ini"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -2770,7 +2840,11 @@ export default function App() {
                               <Video className="w-5 h-5 text-sky-400" />
                             </div>
                           ) : (
-                            <img src={media.src} alt={media.title} className="w-16 h-12 rounded-lg object-cover shrink-0" />
+                            <img
+                              src={resolveImageUrl(media.src)}
+                              alt={media.title}
+                              className="w-16 h-12 rounded-lg object-cover shrink-0 border"
+                            />
                           )}
                           <div>
                             <p className="font-bold text-slate-900">
@@ -2780,21 +2854,39 @@ export default function App() {
                           </div>
                         </div>
 
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (tempConfig.galleryMedia.length <= 1) {
-                              alert('Sisakan minimal 1 media di galeri!');
-                              return;
-                            }
-                            const filtered = tempConfig.galleryMedia.filter((_, i) => i !== idx);
-                            setTempConfig({ ...tempConfig, galleryMedia: filtered });
-                          }}
-                          className="p-1.5 text-red-500 hover:text-red-700 hover:bg-red-50 rounded-lg"
-                          title="Hapus media ini"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
+                        <div className="flex flex-col gap-1.5 shrink-0 items-end">
+                          {media.type === 'image' && (
+                            <label className="px-2.5 py-1 text-xs font-bold text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded-lg cursor-pointer flex items-center gap-1 transition-colors">
+                              <Upload className="w-3.5 h-3.5" />
+                              <span>Ganti Foto</span>
+                              <input
+                                type="file"
+                                accept="image/*"
+                                className="hidden"
+                                onChange={(e) => handleImageFileUpload(e, (base64) => {
+                                  const updated = [...tempConfig.galleryMedia];
+                                  updated[idx].src = base64;
+                                  setTempConfig({ ...tempConfig, galleryMedia: updated });
+                                })}
+                              />
+                            </label>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (tempConfig.galleryMedia.length <= 1) {
+                                alert('Sisakan minimal 1 media di galeri!');
+                                return;
+                              }
+                              const filtered = tempConfig.galleryMedia.filter((_, i) => i !== idx);
+                              setTempConfig({ ...tempConfig, galleryMedia: filtered });
+                            }}
+                            className="p-1.5 text-red-500 hover:text-red-700 hover:bg-red-50 rounded-lg cursor-pointer"
+                            title="Hapus media ini"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -3564,7 +3656,7 @@ export default function App() {
 
             <div className="max-h-[75vh] bg-black flex items-center justify-center">
               <img
-                src={selectedPhotoForZoom.src}
+                src={resolveImageUrl(selectedPhotoForZoom.src)}
                 alt={selectedPhotoForZoom.title}
                 className="max-h-[75vh] w-auto object-contain mx-auto"
                 referrerPolicy="no-referrer"
@@ -3769,7 +3861,7 @@ export default function App() {
 
             <div className="bg-slate-50 p-3 rounded-2xl border border-slate-200 shadow-inner">
               <img
-                src={config.qrisImage}
+                src={resolveImageUrl(config.qrisImage)}
                 alt={`QRIS Standar Nasional ${config.communityName}`}
                 className="w-full h-auto rounded-xl object-contain mx-auto"
                 referrerPolicy="no-referrer"
@@ -3778,7 +3870,7 @@ export default function App() {
 
             <div className="mt-5 flex items-center justify-center gap-3">
               <a
-                href={config.qrisImage}
+                href={resolveImageUrl(config.qrisImage)}
                 download="QRIS_Berbagi_Kebikean.jpg"
                 target="_blank"
                 rel="noreferrer"
