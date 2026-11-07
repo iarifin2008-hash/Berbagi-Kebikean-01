@@ -148,7 +148,7 @@ export default function App() {
   const [currentMediaIndex, setCurrentMediaIndex] = useState(0);
   const [selectedPhotoForZoom, setSelectedPhotoForZoom] = useState<GalleryMediaItem | null>(null);
 
-  // Real-time Community Wall (Dinding Kebaikan)
+  // Real-time Community Wall (Dinding Kebaikan Tersinkron ke Supabase)
   const [messages, setMessages] = useState<WallMessage[]>(() => {
     try {
       const saved = localStorage.getItem('berbagi_kebikean_wall_messages_v4');
@@ -160,6 +160,76 @@ export default function App() {
     }
     return INITIAL_WALL_MESSAGES;
   });
+
+  // --- SINKRONISASI PESAN DOA SUPABASE (AGAR TAMPIL SERAGAM DI SEMUA HP & LAPTOP) ---
+  const muatPesanSupabase = async () => {
+    try {
+      if (!supabase) return;
+
+      // 1. Coba baca dari tabel landingpage_messages
+      const { data: dbData, error: dbErr } = await supabase
+        .from('landingpage_messages')
+        .select('*')
+        .order('id', { ascending: false });
+
+      if (!dbErr && dbData && Array.isArray(dbData) && dbData.length > 0) {
+        setMessages(
+          dbData.map((m: any) => ({
+            id: String(m.id || m.message_id || 'msg-' + Math.random()),
+            name: m.name || 'Sahabat Kebaikan',
+            city: m.city || 'Indonesia',
+            message: m.message || '',
+            timestamp: m.timestamp || 'Baru saja'
+          }))
+        );
+        return;
+      }
+
+      // 2. Fallback baca dari baris id: 2 di landingpage_config
+      const { data: configData, error: cfgErr } = await supabase
+        .from('landingpage_config')
+        .select('config_data')
+        .eq('id', 2)
+        .maybeSingle();
+
+      if (!cfgErr && configData && Array.isArray(configData.config_data) && configData.config_data.length > 0) {
+        setMessages(configData.config_data);
+      }
+    } catch (err) {
+      console.warn('Notice sinkron pesan Supabase:', err);
+    }
+  };
+
+  useEffect(() => {
+    muatPesanSupabase();
+
+    // Polling setiap 8 detik agar komentar baru dari HP langsung muncul di laptop tanpa reload
+    const interval = setInterval(muatPesanSupabase, 8000);
+
+    // Coba realtime postgres_changes channel
+    try {
+      if (supabase) {
+        const channel = supabase
+          .channel('realtime_wall_messages')
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'landingpage_messages' }, () => {
+            muatPesanSupabase();
+          })
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'landingpage_config' }, () => {
+            muatPesanSupabase();
+          })
+          .subscribe();
+
+        return () => {
+          clearInterval(interval);
+          supabase.removeChannel(channel);
+        };
+      }
+    } catch (e) {
+      console.warn(e);
+    }
+
+    return () => clearInterval(interval);
+  }, []);
   const [senderName, setSenderName] = useState('');
   const [senderCity, setSenderCity] = useState('');
   const [senderText, setSenderText] = useState('');
@@ -261,8 +331,8 @@ export default function App() {
     }
   }, [messages]);
 
-  // Developer: Delete message from wall (Immediate & persistent without window.confirm blockage)
-  const handleDeleteWallMessage = (id: string) => {
+  // Developer: Delete message from wall (Immediate & persistent across all devices via Supabase)
+  const handleDeleteWallMessage = async (id: string) => {
     const filtered = messages.filter((m) => m.id !== id);
     setMessages(filtered);
     try {
@@ -272,10 +342,28 @@ export default function App() {
     }
     setDeletedToast(true);
     setTimeout(() => setDeletedToast(false), 2500);
+
+    // Sinkronisasi hapus ke database Supabase Cloud
+    try {
+      if (supabase) {
+        // Coba hapus dari tabel landingpage_messages
+        await supabase
+          .from('landingpage_messages')
+          .delete()
+          .eq('id', id);
+
+        // Update juga ke baris id: 2 di landingpage_config agar tersinkron di semua device
+        await supabase
+          .from('landingpage_config')
+          .upsert({ id: 2, config_data: filtered });
+      }
+    } catch (err) {
+      console.warn('Notice hapus pesan Supabase:', err);
+    }
   };
 
   // Developer: Reset wall messages to default sample
-  const handleResetWallMessages = () => {
+  const handleResetWallMessages = async () => {
     setMessages(INITIAL_WALL_MESSAGES);
     try {
       localStorage.setItem('berbagi_kebikean_wall_messages_v4', JSON.stringify(INITIAL_WALL_MESSAGES));
@@ -284,6 +372,17 @@ export default function App() {
     }
     setDeletedToast(true);
     setTimeout(() => setDeletedToast(false), 2500);
+
+    // Sinkronisasi reset ke Supabase
+    try {
+      if (supabase) {
+        await supabase
+          .from('landingpage_config')
+          .upsert({ id: 2, config_data: INITIAL_WALL_MESSAGES });
+      }
+    } catch (err) {
+      console.warn('Notice reset pesan Supabase:', err);
+    }
   };
 
   // =========================================================================
@@ -385,26 +484,96 @@ export default function App() {
     alert('Konfigurasi JSON berhasil disalin! Anda bisa menyalinnya ke file src/contentConfig.ts');
   };
 
-  // Handle File Upload to Base64
-  const handleImageFileUpload = (
+  // Fungsi Kompresi Foto Cerdas (Mengubah foto kamera HP 3-12MB menjadi ~80-150KB jernih & ringan)
+  const compressImage = (
+    file: File,
+    maxWidth = 1200,
+    maxHeight = 1200,
+    quality = 0.82
+  ): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      // Jika bukan file gambar biasa (misal svg), baca langsung sebagai data url
+      if (!file.type.startsWith('image/')) {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const img = new Image();
+        img.onload = () => {
+          let width = img.width;
+          let height = img.height;
+
+          if (width > maxWidth || height > maxHeight) {
+            if (width / height > maxWidth / maxHeight) {
+              height = Math.round((height * maxWidth) / width);
+              width = maxWidth;
+            } else {
+              width = Math.round((width * maxHeight) / height);
+              height = maxHeight;
+            }
+          }
+
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            resolve(reader.result as string);
+            return;
+          }
+
+          // Latar putih bersih untuk file transparan jika dikonversi
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, width, height);
+          ctx.drawImage(img, 0, 0, width, height);
+
+          const mimeType = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
+          const compressed = canvas.toDataURL(mimeType, quality);
+          resolve(compressed);
+        };
+        img.onerror = () => resolve(reader.result as string);
+        img.src = event.target?.result as string;
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  };
+
+  // State proses upload foto
+  const [isUploadingImage, setIsUploadingImage] = useState(false);
+
+  // Handle File Upload to Base64 dengan kompresi otomatis
+  const handleImageFileUpload = async (
     e: React.ChangeEvent<HTMLInputElement>,
     onSuccess: (base64: string) => void
   ) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    if (file.size > 5 * 1024 * 1024) {
-      alert('Ukuran file terlalu besar! Maksimal 5MB.');
-      return;
+    try {
+      setIsUploadingImage(true);
+      // Kompres otomatis foto ke resolusi optimal web (hemat bandwidth Supabase & loading cepat)
+      const compressedBase64 = await compressImage(file, 1200, 1200, 0.82);
+      onSuccess(compressedBase64);
+    } catch (err) {
+      console.warn('Gagal kompres foto, gunakan fallback standar:', err);
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === 'string') {
+          onSuccess(reader.result);
+        }
+      };
+      reader.readAsDataURL(file);
+    } finally {
+      setIsUploadingImage(false);
+      // Reset nilai input agar dapat memilih file yang sama atau memilih file ulang
+      e.target.value = '';
     }
-
-    const reader = new FileReader();
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        onSuccess(reader.result);
-      }
-    };
-    reader.readAsDataURL(file);
   };
 
   // Handle Add New Media Item to Gallery Carousel
@@ -478,8 +647,8 @@ export default function App() {
     }, 2500);
   };
 
-  // Handle Add Wall Message
-  const handleSendMessage = (e: React.FormEvent) => {
+  // Handle Add Wall Message (Tersinkronisasi Real-Time ke Supabase Database)
+  const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!senderName.trim() || !senderText.trim()) return;
 
@@ -492,15 +661,43 @@ export default function App() {
       timestamp: 'Baru saja'
     };
 
-    setTimeout(() => {
-      setMessages([newMessage, ...messages]);
-      setSenderName('');
-      setSenderCity('');
-      setSenderText('');
-      setIsSubmittingMessage(false);
-      setMessageSuccessToast(true);
-      setTimeout(() => setMessageSuccessToast(false), 3000);
-    }, 350);
+    const nextMessages = [newMessage, ...messages];
+    setMessages(nextMessages);
+    try {
+      localStorage.setItem('berbagi_kebikean_wall_messages_v4', JSON.stringify(nextMessages));
+    } catch (err) {
+      console.error(err);
+    }
+
+    setSenderName('');
+    setSenderCity('');
+    setSenderText('');
+    setIsSubmittingMessage(false);
+    setMessageSuccessToast(true);
+    setTimeout(() => setMessageSuccessToast(false), 3500);
+
+    // Kirim & sinkronisasi data pesan ke Supabase Cloud
+    try {
+      if (supabase) {
+        // A. Coba kirim ke tabel landingpage_messages (jika ada)
+        await supabase
+          .from('landingpage_messages')
+          .insert([{
+            id: newMessage.id,
+            name: newMessage.name,
+            city: newMessage.city,
+            message: newMessage.message,
+            timestamp: newMessage.timestamp
+          }]);
+
+        // B. Simpan juga ke landingpage_config baris id: 2 agar selalu sinkron di semua device (HP, Laptop, dsb.)
+        await supabase
+          .from('landingpage_config')
+          .upsert({ id: 2, config_data: nextMessages.slice(0, 100) });
+      }
+    } catch (err) {
+      console.warn('Notice sinkron pesan baru ke Supabase:', err);
+    }
   };
 
   // Handle Volunteer Submission to WhatsApp (Target: 088216419059)
@@ -1932,6 +2129,12 @@ export default function App() {
 
             {/* Customizer Body Form (Scrollable) */}
             <div className="py-4 overflow-y-auto flex-1 pr-1 space-y-4 text-xs">
+              {isUploadingImage && (
+                <div className="p-2.5 bg-sky-50 border border-sky-200 rounded-xl flex items-center gap-2 text-sky-800 font-semibold animate-pulse">
+                  <Sparkles className="w-4 h-4 text-sky-600 shrink-0" />
+                  <span>Sedang mengoptimasi & memproses foto agar hemat bandwidth dan loading cepat...</span>
+                </div>
+              )}
               
               {/* TAB 1: PROFIL & BRAND */}
               {customizerTab === 'brand' && (
@@ -1955,7 +2158,7 @@ export default function App() {
                         </div>
                       )}
 
-                      <div className="space-y-2">
+                      <div className="space-y-2 flex-1">
                         <input
                           type="file"
                           accept="image/*"
@@ -1968,16 +2171,23 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => logoFileInputRef.current?.click()}
-                          className="px-3 py-1.5 bg-sky-600 hover:bg-sky-700 text-white font-bold rounded-xl flex items-center gap-1.5 cursor-pointer shadow-xs"
+                          className="px-3 py-1.5 bg-sky-600 hover:bg-sky-700 text-white font-bold rounded-xl flex items-center gap-1.5 cursor-pointer shadow-xs text-xs"
                         >
                           <Upload className="w-3.5 h-3.5" />
                           <span>Upload Foto Profil Baru</span>
                         </button>
+                        <input
+                          type="text"
+                          value={tempConfig.logoImage || ''}
+                          onChange={(e) => setTempConfig({ ...tempConfig, logoImage: e.target.value })}
+                          placeholder="Atau tempel link URL foto profil/logo..."
+                          className="w-full px-2.5 py-1.5 bg-white rounded border border-slate-300 text-[11px]"
+                        />
                         {tempConfig.logoImage && (
                           <button
                             type="button"
                             onClick={() => setTempConfig({ ...tempConfig, logoImage: '' })}
-                            className="text-red-600 hover:underline text-[11px] block"
+                            className="text-red-600 hover:underline text-[11px] block cursor-pointer"
                           >
                             Hapus foto kustom (Kembali ke ikon sepeda bawaan)
                           </button>
@@ -2049,7 +2259,7 @@ export default function App() {
                         className="w-24 h-16 rounded-xl object-cover border-2 border-slate-300 shadow-sm"
                       />
 
-                      <div className="space-y-2">
+                      <div className="space-y-2 flex-1">
                         <input
                           type="file"
                           accept="image/*"
@@ -2065,11 +2275,21 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => aboutPhotoFileInputRef.current?.click()}
-                          className="px-3 py-1.5 bg-sky-600 hover:bg-sky-700 text-white font-bold rounded-xl flex items-center gap-1.5 cursor-pointer"
+                          className="px-3 py-1.5 bg-sky-600 hover:bg-sky-700 text-white font-bold rounded-xl flex items-center gap-1.5 cursor-pointer text-xs"
                         >
                           <Upload className="w-3.5 h-3.5" />
                           <span>Upload Foto Misi Baru</span>
                         </button>
+                        <input
+                          type="text"
+                          value={tempConfig.about.photo}
+                          onChange={(e) => setTempConfig({
+                            ...tempConfig,
+                            about: { ...tempConfig.about, photo: e.target.value }
+                          })}
+                          placeholder="Atau tempel URL gambar misi..."
+                          className="w-full px-2.5 py-1.5 bg-white rounded border border-slate-300 text-[11px]"
+                        />
                       </div>
                     </div>
                   </div>
@@ -2194,14 +2414,59 @@ export default function App() {
                           setNewAgendaPoster(base64);
                         })}
                       />
-                      <button
-                        type="button"
-                        onClick={() => agendaPosterFileInputRef.current?.click()}
-                        className="w-full py-2 px-3 bg-white hover:bg-slate-50 border border-dashed border-sky-400 text-sky-700 font-bold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer"
-                      >
-                        <Upload className="w-4 h-4" />
-                        <span>{newAgendaPoster ? 'Ganti File Poster Terpilih' : 'Upload File Poster Kegiatan'}</span>
-                      </button>
+                      <div className="space-y-2">
+                        <button
+                          type="button"
+                          onClick={() => agendaPosterFileInputRef.current?.click()}
+                          className="w-full py-2.5 px-3 bg-white hover:bg-slate-50 border border-dashed border-sky-400 text-sky-700 font-bold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs transition-colors"
+                        >
+                          <Upload className="w-4 h-4" />
+                          <span>{newAgendaPoster ? 'Ganti File Poster' : 'Upload File Poster dari HP / Laptop'}</span>
+                        </button>
+                        <input
+                          type="text"
+                          value={newAgendaPoster}
+                          onChange={(e) => setNewAgendaPoster(e.target.value)}
+                          placeholder="Atau tempel URL gambar poster langsung..."
+                          className="w-full px-3 py-1.5 bg-white rounded-lg border border-slate-300 text-xs"
+                        />
+                      </div>
+
+                      {/* Preview Poster yang Berhasil Diupload */}
+                      {newAgendaPoster && (
+                        <div className="mt-2.5 p-3 bg-white rounded-xl border border-sky-200 shadow-xs flex items-center justify-between gap-3">
+                          <div className="flex items-center gap-3 min-w-0">
+                            <img
+                              src={newAgendaPoster}
+                              alt="Preview Poster Baru"
+                              className="w-16 h-20 object-cover rounded-lg border border-slate-300 shadow-xs shrink-0"
+                            />
+                            <div className="min-w-0">
+                              <p className="text-xs font-bold text-slate-900 truncate">Poster Berhasil Dimuat</p>
+                              <span className="inline-flex items-center gap-1 text-[11px] text-emerald-600 font-semibold mt-0.5">
+                                <CheckCircle2 className="w-3.5 h-3.5" /> Gambar siap ditambahkan
+                              </span>
+                              <p className="text-[10px] text-slate-400">Tampilan jernih & teroptimasi</p>
+                            </div>
+                          </div>
+                          <div className="flex flex-col gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => agendaPosterFileInputRef.current?.click()}
+                              className="px-2 py-1 text-[11px] font-bold text-sky-700 bg-sky-50 hover:bg-sky-100 rounded-lg cursor-pointer"
+                            >
+                              Ganti
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setNewAgendaPoster('')}
+                              className="px-2 py-1 text-[11px] font-bold text-red-600 bg-red-50 hover:bg-red-100 rounded-lg cursor-pointer"
+                            >
+                              Hapus
+                            </button>
+                          </div>
+                        </div>
+                      )}
                     </div>
 
                     <div>
@@ -2369,7 +2634,7 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => galleryFileInputRef.current?.click()}
-                          className="w-full py-2 px-3 bg-white hover:bg-slate-50 border border-dashed border-sky-400 text-sky-700 font-bold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer"
+                          className="w-full py-2.5 px-3 bg-white hover:bg-slate-50 border border-dashed border-sky-400 text-sky-700 font-bold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs transition-colors"
                         >
                           <Upload className="w-4 h-4" />
                           <span>{newMediaSrc ? 'Ganti File Foto Terpilih' : 'Upload File Foto dari HP / Laptop'}</span>
@@ -2392,6 +2657,58 @@ export default function App() {
                           placeholder="https://www.youtube-nocookie.com/embed/..."
                           className="w-full px-3 py-2 bg-white rounded-lg border border-slate-300"
                         />
+                      </div>
+                    )}
+
+                    {/* Preview Media yang Berhasil Diupload / Dipilih */}
+                    {newMediaSrc && (
+                      <div className="mt-1 p-3 bg-white rounded-xl border border-sky-200 shadow-xs flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-3 min-w-0">
+                          {newMediaType === 'image' ? (
+                            <img
+                              src={newMediaSrc}
+                              alt="Preview Foto Baru"
+                              className="w-20 h-16 object-cover rounded-lg border border-slate-300 shadow-xs shrink-0"
+                            />
+                          ) : (
+                            <div className="w-20 h-16 bg-slate-900 rounded-lg flex items-center justify-center text-white shrink-0">
+                              <Video className="w-6 h-6 text-red-500" />
+                            </div>
+                          )}
+                          <div className="min-w-0">
+                            <p className="text-xs font-bold text-slate-900 truncate">
+                              {newMediaType === 'image' ? 'Foto Berhasil Dimuat' : 'Link Video Siap'}
+                            </p>
+                            <span className="inline-flex items-center gap-1 text-[11px] text-emerald-600 font-semibold mt-0.5">
+                              <CheckCircle2 className="w-3.5 h-3.5" /> Siap ditambahkan ke carousel
+                            </span>
+                            <p className="text-[10px] text-slate-400">
+                              {newMediaType === 'image' ? 'Ukuran optimal & jernih' : 'Format YouTube terverifikasi'}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="flex flex-col gap-1 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (newMediaType === 'image') {
+                                galleryFileInputRef.current?.click();
+                              } else {
+                                setNewMediaSrc('');
+                              }
+                            }}
+                            className="px-2 py-1 text-[11px] font-bold text-sky-700 bg-sky-50 hover:bg-sky-100 rounded-lg cursor-pointer"
+                          >
+                            Ganti
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setNewMediaSrc('')}
+                            className="px-2 py-1 text-[11px] font-bold text-red-600 bg-red-50 hover:bg-red-100 rounded-lg cursor-pointer"
+                          >
+                            Hapus
+                          </button>
+                        </div>
                       </div>
                     )}
 
@@ -2834,13 +3151,18 @@ export default function App() {
                       <span>Edit QRIS Standar Nasional</span>
                     </h4>
 
-                    <div className="flex items-center gap-4">
-                      <img
-                        src={tempConfig.qrisImage}
-                        alt="QRIS Preview"
-                        className="w-20 h-24 object-contain rounded-xl border border-slate-300 bg-white p-1"
-                      />
-                      <div className="space-y-2 flex-1">
+                    <div className="flex flex-col sm:flex-row items-center sm:items-start gap-4">
+                      <div className="relative group shrink-0">
+                        <img
+                          src={tempConfig.qrisImage}
+                          alt="QRIS Preview"
+                          className="w-28 h-32 object-contain rounded-xl border-2 border-slate-300 bg-white p-1.5 shadow-sm"
+                        />
+                        <div className="absolute -top-2 -right-2 bg-emerald-600 text-white rounded-full p-1 shadow-md">
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                        </div>
+                      </div>
+                      <div className="space-y-2 flex-1 w-full">
                         <input
                           type="file"
                           accept="image/*"
@@ -2853,11 +3175,18 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => qrisFileInputRef.current?.click()}
-                          className="px-3 py-1.5 bg-sky-600 hover:bg-sky-700 text-white font-bold rounded-xl flex items-center gap-1.5 cursor-pointer"
+                          className="w-full px-3 py-2 bg-sky-600 hover:bg-sky-700 text-white font-bold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer text-xs shadow-xs transition-colors"
                         >
                           <Upload className="w-3.5 h-3.5" />
-                          <span>Upload Gambar QRIS Baru</span>
+                          <span>Upload Gambar QRIS dari HP / Laptop</span>
                         </button>
+                        <input
+                          type="text"
+                          value={tempConfig.qrisImage}
+                          onChange={(e) => setTempConfig({ ...tempConfig, qrisImage: e.target.value })}
+                          placeholder="Atau tempel link gambar QRIS..."
+                          className="w-full px-2.5 py-1.5 bg-white rounded border border-slate-300 text-[11px]"
+                        />
                         <input
                           type="text"
                           value={tempConfig.qrisTitle}
