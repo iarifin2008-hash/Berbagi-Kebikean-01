@@ -1,0 +1,6 @@
+{
+  "name": "Berbagi Kebikean",
+  "description": "Landing page resmi komunitas sosial Berbagi Kebikean - Mengayuh Harapan, Membagi Kebaikan makanan sehat dengan sepeda di jalanan.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
